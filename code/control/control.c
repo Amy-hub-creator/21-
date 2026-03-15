@@ -1,0 +1,374 @@
+/*
+ * control.c
+ *
+ *  Created on: 2025年8月16日
+ *      Author: Pathetic.
+ */
+
+#include "control.h"
+
+// 结构体定义
+control_temp_struct control_temp;
+control_speed_struct control_speed;
+control_steering_struct control_steering;
+control_parameters_struct control_parameters;
+control_pwm_out_struct control_pwm_out;
+global_flag_struct global_flag;
+// 结构体指针初始化
+control_temp_struct* ctrl_temp = &control_temp;
+control_speed_struct* ctrl_speed = &control_speed;
+control_steering_struct* ctrl_steering = &control_steering;
+control_parameters_struct* ctrl_parameters = &control_parameters;
+control_pwm_out_struct* ctrl_pwm_out = &control_pwm_out;
+global_flag_struct* glb_flag = &global_flag;
+
+//------------------------------------------------------------------------------
+// 函数简介     编码器读数
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0    先用左相
+//------------------------------------------------------------------------------
+void speed_get(void)
+{
+    printf("left speed:%d, right speed:%d\r\n", motor_value.receive_left_speed_data, motor_value.receive_right_speed_data);
+    // 读取 方向解码 脉冲数
+    ctrl_temp->encoder_count = -motor_value.receive_right_speed_data;
+}
+
+//------------------------------------------------------------------------------
+// 函数简介     路程获取
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0    方向编码器
+//------------------------------------------------------------------------------
+void lucheng_get(void)
+{
+    ctrl_temp->lucheng += (float)(1.0f * ctrl_temp->encoder_count);
+}
+
+//------------------------------------------------------------------------------
+// 函数简介     低通滤波
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+void low_pass_filter_calc(void)
+{
+    ctrl_temp->encoder_speed = ctrl_temp->encoder_count;
+    static int16 encoder_speed_last = 0 ;
+    ctrl_temp->encoder_speed = (int16)(ctrl_temp->encoder_speed * ctrl_parameters->low_pass_filter_k + (1 - ctrl_parameters->low_pass_filter_k) * encoder_speed_last);
+    encoder_speed_last = ctrl_temp->encoder_speed;
+}
+
+//------------------------------------------------------------------------------
+// 函数简介     电机pid
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+void motor_pid_calc(void)
+{
+    static int16 speedset = 0;
+
+    ctrl_temp->motor_speed = ctrl_temp->encoder_speed;
+    speedset = (int16)(ctrl_parameters->setspeed * 1.0f);
+
+
+    // 偏差
+    ctrl_temp->speed_error_2 = ctrl_temp->speed_error_1;
+    ctrl_temp->speed_error_1 = ctrl_temp->speed_error_0;
+    ctrl_temp->speed_error_0 = speedset - ctrl_temp->motor_speed;
+
+
+    // 比例
+    ctrl_temp->motor_proportion = ctrl_temp->speed_error_0 - ctrl_temp->speed_error_1;
+    // 积分
+    ctrl_temp->motor_integral = ctrl_temp->speed_error_0;
+    // 微分
+    ctrl_temp->motor_derivation = ctrl_temp->speed_error_0 - 2 * ctrl_temp->speed_error_1 + ctrl_temp->speed_error_2;
+
+    //积分限幅
+    if(ctrl_temp->motor_integral > ctrl_parameters->motor_integral_lim)
+    {
+        ctrl_temp->motor_integral = ctrl_parameters->motor_integral_lim;
+    }
+    else  if(ctrl_temp->motor_integral < -ctrl_parameters->motor_integral_lim)
+    {
+        ctrl_temp->motor_integral = -ctrl_parameters->motor_integral_lim;
+    }
+    // 增量式pid
+    if(glb_flag->Close_speed_enable)
+    {
+        ctrl_pwm_out->motor_pwm_delta = (int16)(ctrl_parameters->motor_kp * ctrl_temp->motor_proportion + ctrl_parameters->motor_ki * ctrl_temp->motor_integral + ctrl_parameters->motor_kd * ctrl_temp->motor_derivation);
+        ctrl_pwm_out->motor_pwm_out += ctrl_pwm_out->motor_pwm_delta ;
+    }
+
+    // 限幅
+    if(ctrl_pwm_out->motor_pwm_out > ctrl_parameters->motor_pwm_out_lim * PWM_DUTY_MAX)
+    {
+        ctrl_pwm_out->motor_pwm_out = ctrl_parameters->motor_pwm_out_lim * PWM_DUTY_MAX;
+    }
+    else if(ctrl_pwm_out->motor_pwm_out < -ctrl_parameters->motor_pwm_out_lim * PWM_DUTY_MAX)
+    {
+        ctrl_pwm_out->motor_pwm_out = -ctrl_parameters->motor_pwm_out_lim * PWM_DUTY_MAX;
+    }
+}
+//------------------------------------------------------------------------------
+// 函数简介     舵机角度环（二级）
+// 参数说明     Pitch往右倒是正数，舵机此时应当向右打，即增大PWM
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+float Pitch_Loop_error = 0.0f;
+float Pitch_Loop_error0 = 0.0f;//上次误差
+float Pitch_Loop_Kp = 1.0f;
+float Pitch_Loop_Kd = 0.0f;
+float Pitch_u = 0.0f;
+void Pitch_PID_Controller(float Error_Loop_Out)
+{
+    Pitch_Loop_error = -Pitch + Error_Loop_Out ;
+    Pitch_u = Pitch_Loop_Kp * Pitch_Loop_error + Pitch_Loop_Kd * (Pitch_Loop_error - Pitch_Loop_error0);
+    Pitch_Loop_error0 = Pitch_Loop_error;
+}
+
+//------------------------------------------------------------------------------
+// 函数简介     舵机角速度环（三级）
+// 参数说明     Gyro_X往右倒是正数，舵机此时应当向右打，即增大PWM
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+float Gyro_x_Loop_error = 0.0f;
+float Gyro_x_Loop_error0 = 0.0f;//上次误差
+float Gyro_x_Loop_Kp = 3.0f;
+float Gyro_x_Loop_Kd = 0.0f;
+void Gyro_x_PID_Controller(float Pitch_Loop_Out)
+{
+    Gyro_x_Loop_error = Gyro_x - Pitch_Loop_Out ;
+    ctrl_pwm_out->steering_pwm_delta = Gyro_x_Loop_Kp * Gyro_x_Loop_error + Gyro_x_Loop_Kd * (Gyro_x_Loop_error - Gyro_x_Loop_error0);
+    ctrl_pwm_out->steering_pwm_out = steering_middle + ctrl_pwm_out->steering_pwm_delta;
+    Gyro_x_Loop_error0 = Gyro_x_Loop_error;
+    if(ctrl_pwm_out->steering_pwm_out < steering_left)
+        ctrl_pwm_out->steering_pwm_out = steering_left;
+    else if(ctrl_pwm_out->steering_pwm_out > steering_right)
+        ctrl_pwm_out->steering_pwm_out = steering_right;
+
+}
+//------------------------------------------------------------------------------
+// 函数简介     舵机pdk
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+void steering_pdk_calc(void)
+{
+
+}
+
+//------------------------------------------------------------------------------
+// 函数简介     动态控制
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+void dynamic_ctrl(void)
+{
+
+     ctrl_parameters->steering_kp = ctrl_steering->steering_kp_straight;
+     ctrl_parameters->steering_kd = ctrl_steering->steering_kd_straight;
+     ctrl_parameters->steering_kk = ctrl_steering->steering_kk_straight;
+
+    // 闭环
+    if(glb_flag->Close_speed_enable == 1)
+    {
+        ctrl_parameters->setspeed = ctrl_speed->close_speed_straight;
+    }
+    // 开环
+    else
+    {
+        ctrl_pwm_out->motor_pwm_out = ctrl_speed->open_speed_straight;
+    }
+}
+
+
+
+small_device_value_struct motor_value;      // 定义通讯参数结构体
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     无刷驱动 串口接收回调函数
+// 参数说明     void
+// 返回参数     void
+// 使用示例     uart_control_callback(1000, -1000);
+// 备注信息     用于解析接收到的速度数据  该函数需要在对应的串口接收中断中调用
+//-------------------------------------------------------------------------------------------------------------------
+void uart_control_callback(void)
+{
+    uint8 receive_data;                                                                     // 定义临时变量
+
+    if(uart_query_byte(SMALL_DRIVER_UART, &receive_data))                                   // 接收串口数据
+    {
+        if(receive_data == 0xA5 && motor_value.receive_data_buffer[0] != 0xA5)              // 判断是否收到帧头 并且 当前接收内容中是否正确包含帧头
+        {
+            motor_value.receive_data_count = 0;                                             // 未收到帧头或者未正确包含帧头则重新接收
+        }
+
+        motor_value.receive_data_buffer[motor_value.receive_data_count ++] = receive_data;  // 保存串口数据
+
+        if(motor_value.receive_data_count >= 7)                                             // 判断是否接收到指定数量的数据
+        {
+            if(motor_value.receive_data_buffer[0] == 0xA5)                                  // 判断帧头是否正确
+            {
+
+                motor_value.sum_check_data = 0;                                             // 清除校验位数据
+
+                for(int i = 0; i < 6; i ++)
+                {
+                    motor_value.sum_check_data += motor_value.receive_data_buffer[i];       // 重新计算校验位
+                }
+
+                if(motor_value.sum_check_data == motor_value.receive_data_buffer[6])        // 校验数据准确性
+                {
+
+                    if(motor_value.receive_data_buffer[1] == 0x02)                          // 判断是否正确接收到 速度输出 功能字
+                    {
+                        motor_value.receive_left_speed_data  = (((int)motor_value.receive_data_buffer[2] << 8) | (int)motor_value.receive_data_buffer[3]);  // 拟合左侧电机转速数据
+
+                        motor_value.receive_right_speed_data = (((int)motor_value.receive_data_buffer[4] << 8) | (int)motor_value.receive_data_buffer[5]);  // 拟合右侧电机转速数据
+                    }
+
+                    motor_value.receive_data_count = 0;                                     // 清除缓冲区计数值
+
+                    memset(motor_value.receive_data_buffer, 0, 7);                          // 清除缓冲区数据
+                }
+                else
+                {
+                    motor_value.receive_data_count = 0;                                     // 清除缓冲区计数值
+
+                    memset(motor_value.receive_data_buffer, 0, 7);                          // 清除缓冲区数据
+                }
+            }
+            else
+            {
+                motor_value.receive_data_count = 0;                                         // 清除缓冲区计数值
+
+                memset(motor_value.receive_data_buffer, 0, 7);                              // 清除缓冲区数据
+            }
+        }
+    }
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     无刷驱动 设置电机占空比
+// 参数说明     left_duty       左侧电机占空比  范围 -10000 ~ 10000  负数为反转
+// 参数说明     right_duty      右侧电机占空比  范围 -10000 ~ 10000  负数为反转
+// 返回参数     void
+// 使用示例     small_driver_set_duty(1000, -1000);
+// 备注信息
+//-------------------------------------------------------------------------------------------------------------------
+void small_driver_set_duty(int16 left_duty, int16 right_duty)
+{
+    motor_value.send_data_buffer[0] = 0xA5;                                         // 配置帧头
+
+    motor_value.send_data_buffer[1] = 0X01;                                         // 配置功能字
+
+    motor_value.send_data_buffer[2] = (uint8)((left_duty & 0xFF00) >> 8);           // 拆分 左侧占空比 的高八位
+
+    motor_value.send_data_buffer[3] = (uint8)(left_duty & 0x00FF);                  // 拆分 左侧占空比 的低八位
+
+    motor_value.send_data_buffer[4] = (uint8)((right_duty & 0xFF00) >> 8);          // 拆分 右侧占空比 的高八位
+
+    motor_value.send_data_buffer[5] = (uint8)(right_duty & 0x00FF);                 // 拆分 右侧占空比 的低八位
+
+    motor_value.send_data_buffer[6] = 0;                                            // 和校验清除
+
+    for(int i = 0; i < 6; i ++)
+    {
+        motor_value.send_data_buffer[6] += motor_value.send_data_buffer[i];         // 计算校验位
+    }
+
+    uart_write_buffer(SMALL_DRIVER_UART, motor_value.send_data_buffer, 7);                     // 发送设置占空比的 字节包 数据
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     无刷驱动 获取速度信息
+// 参数说明     void
+// 返回参数     void
+// 使用示例     small_driver_get_speed();
+// 备注信息     仅需发送一次 驱动将周期发出速度信息(默认10ms)
+//-------------------------------------------------------------------------------------------------------------------
+void small_driver_get_speed(void)
+{
+    motor_value.send_data_buffer[0] = 0xA5;                                         // 配置帧头
+
+    motor_value.send_data_buffer[1] = 0X02;                                         // 配置功能字
+
+    motor_value.send_data_buffer[2] = 0x00;                                         // 数据位清空
+
+    motor_value.send_data_buffer[3] = 0x00;                                         // 数据位清空
+
+    motor_value.send_data_buffer[4] = 0x00;                                         // 数据位清空
+
+    motor_value.send_data_buffer[5] = 0x00;                                         // 数据位清空
+
+    motor_value.send_data_buffer[6] = 0xA7;                                         // 配置校验位
+
+    uart_write_buffer(SMALL_DRIVER_UART, motor_value.send_data_buffer, 7);                     // 发送获取转速数据的 字节包 数据
+}
+
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     无刷驱动 参数初始化
+// 参数说明     void
+// 返回参数     void
+// 使用示例     small_driver_init();
+// 备注信息
+//-------------------------------------------------------------------------------------------------------------------
+void small_driver_init(void)
+{
+    memset(motor_value.send_data_buffer, 0, 7);                             // 清除缓冲区数据
+
+    memset(motor_value.receive_data_buffer, 0, 7);                          // 清除缓冲区数据
+
+    motor_value.receive_data_count          = 0;
+
+    motor_value.sum_check_data              = 0;
+
+    motor_value.receive_right_speed_data    = 0;
+
+    motor_value.receive_left_speed_data     = 0;
+}
+
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     无刷驱动 串口通讯初始化
+// 参数说明     void
+// 返回参数     void
+// 使用示例     small_driver_uart_init();
+// 备注信息
+//-------------------------------------------------------------------------------------------------------------------
+void small_driver_uart_init(void)
+{
+    uart_init(SMALL_DRIVER_UART, SMALL_DRIVER_BAUDRATE, SMALL_DRIVER_RX, SMALL_DRIVER_TX);      // 串口初始化
+
+    uart_rx_interrupt(SMALL_DRIVER_UART, 1);                                                    // 使能串口接收中断
+
+    small_driver_init();                                                                        // 结构体参数初始化
+
+    small_driver_set_duty(0, 0);                                                                // 设置0占空比
+
+    small_driver_get_speed();                                                                   // 获取实时速度数据
+}
+//------------------------------------------------------------------------------
+// 函数简介     pwm输出
+// 参数说明     无
+// 返回参数     无
+// 备注信息     v1.0
+//------------------------------------------------------------------------------
+void pwm_out(void)
+{
+    // 舵机输出
+    //pwm_set_duty(steering_pwm, 945);
+    pwm_set_duty(steering_pwm, ctrl_pwm_out->steering_pwm_out);
+    small_driver_set_duty(-ctrl_pwm_out->motor_pwm_out,-ctrl_pwm_out->motor_pwm_out);
+    //small_driver_set_duty(0, 0);
+    //pwm_set_duty(steering_pwm, 560);
+}
